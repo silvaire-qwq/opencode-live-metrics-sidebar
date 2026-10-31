@@ -52,27 +52,60 @@ function minNumber(left, right) {
 }
 function summarize(messages) {
   let total = 0;
-  let lastUser = -1;
+  const users = [];
   for (let index = 0; index < messages.length; index++) {
-    if (messages[index].type === "user") lastUser = index;
+    if (messages[index].type === "user") users.push(index);
     if (messages[index].type === "assistant") total += 1;
   }
+  const lastUser = users.at(-1) ?? -1;
   const turn = lastUser < 0 ? 0 : messages.slice(lastUser + 1).filter(message => message.type === "assistant").length;
   let maxCacheHit;
-  let maxTps;
   let minTtft;
   for (const message of messages) {
     if (message.type !== "assistant") continue;
     maxCacheHit = maxNumber(maxCacheHit, hitRate(message.tokens));
-    maxTps = maxNumber(maxTps, exactTps(message));
     minTtft = minNumber(minTtft, ttftFromMessage(message));
+  }
+  let output = 0;
+  let duration = 0;
+  if (lastUser >= 0) {
+    for (let index = lastUser + 1; index < messages.length; index++) {
+      const message = messages[index];
+      if (message.type !== "assistant" || !message.tokens || message.time?.streamed === undefined) continue;
+      output += message.tokens.output + message.tokens.reasoning;
+      duration += Math.max(0, message.time.streamed - message.time.created);
+    }
+  }
+  const turnTps = output > 0 && duration > 0 ? output / (duration / 1000) : undefined;
+  let baseRuntime = 0;
+  let turnStart;
+  let turnEnd;
+  for (let index = 0; index < users.length; index++) {
+    const start = messages[users[index]].time?.created;
+    if (start === undefined) continue;
+    const next = index + 1 < users.length ? users[index + 1] : messages.length;
+    let end;
+    for (let inner = users[index] + 1; inner < next; inner++) {
+      const message = messages[inner];
+      if (message.type !== "assistant" || !message.time) continue;
+      end = message.time.completed ?? message.time.streamed ?? message.time.created;
+    }
+    if (index === users.length - 1) {
+      turnStart = start;
+      turnEnd = end;
+    } else if (end !== undefined) {
+      baseRuntime += Math.max(0, end - start);
+    }
   }
   return {
     turn,
     total,
     maxCacheHit,
-    maxTps,
-    minTtft
+    minTtft,
+    turnTps,
+    turnStart,
+    turnEnd,
+    baseRuntime
   };
 }
 function ttftValue(value) {
@@ -86,6 +119,15 @@ function pctValue(value) {
 function tpsValue(value) {
   if (value === undefined || !Number.isFinite(value)) return "—";
   return value.toFixed(1);
+}
+function durationValue(ms) {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return "—";
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${Math.floor(seconds % 60)}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${minutes % 60}m`;
 }
 const VALUE_WIDTH = 7;
 // Thresholds are based on common chat latency/throughput guidance: TTFT under
@@ -198,8 +240,32 @@ function Panel(props) {
   const ttft = () => current()?.ttft ?? ttftFromMessage(last());
   const tps = () => current()?.tps ?? exactTps(last());
   const maxCacheHit = () => summary()?.maxCacheHit ?? cacheHit();
-  const maxTps = () => summary()?.maxTps ?? tps();
+  const turnTps = () => summary()?.turnTps ?? tps();
   const sessionMinTtft = () => summary()?.minTtft ?? ttft();
+  const running = () => props.ctx.data.session.status(props.sessionID) === "running";
+  const turnStart = () => {
+    const list = messages();
+    for (let index = list.length - 1; index >= 0; index--) {
+      const message = list[index];
+      if (message.type === "user" && message.time?.created) return message.time.created;
+    }
+    return summary()?.turnStart;
+  };
+  const turnMs = () => {
+    const start = turnStart();
+    if (!start) return 0;
+    const data = summary();
+    const end = running() ? Math.max(props.clock.now, start) : data?.turnEnd !== undefined && data.turnEnd > start ? data.turnEnd : start;
+    return Math.max(0, end - start);
+  };
+  const totals = new Map();
+  const sessionMs = () => {
+    const value = (summary()?.baseRuntime ?? 0) + turnMs();
+    const previous = totals.get(props.sessionID) ?? 0;
+    const next = Math.max(previous, value);
+    totals.set(props.sessionID, next);
+    return next;
+  };
   const toggle = () => {
     void props.setView(draft => {
       draft.open = !draft.open;
@@ -237,6 +303,19 @@ function Panel(props) {
     _$insert(_el$9, (() => {
       var _c$3 = _$memo(() => !!!open());
       return () => _c$3() ? null : [_$createComponent(MetricRow, {
+        theme: theme,
+        get width() {
+          return props.ui.width;
+        },
+        label: "Time",
+        get value() {
+          return durationValue(turnMs());
+        },
+        get max() {
+          return durationValue(sessionMs());
+        },
+        level: "good"
+      }), _$createComponent(MetricRow, {
         theme: theme,
         get width() {
           return props.ui.width;
@@ -292,7 +371,7 @@ function Panel(props) {
           return tpsValue(tps());
         },
         get max() {
-          return tpsValue(maxTps());
+          return tpsValue(turnTps());
         },
         get level() {
           return tpsLevel(tps());
@@ -346,7 +425,17 @@ export default Plugin.define({
         width: 34
       }
     });
+    const [clock, setClock] = ctx.storage.memory("clock", {
+      initial: {
+        now: Date.now()
+      }
+    });
     const live = new Map();
+    const clockTimer = setInterval(() => {
+      setClock(draft => {
+        draft.now = Date.now();
+      });
+    }, 100);
     const set = (sessionID, patch) => {
       setMetrics(draft => {
         draft[sessionID] = {
@@ -471,6 +560,7 @@ export default Plugin.define({
         metrics: metrics,
         summary: summary,
         ensureSummary: ensureSummary,
+        clock: clock,
         view: view,
         setView: setView,
         ui: ui,
@@ -479,6 +569,7 @@ export default Plugin.define({
     });
     return () => {
       clearInterval(timer);
+      clearInterval(clockTimer);
       stop();
       dispose();
     };

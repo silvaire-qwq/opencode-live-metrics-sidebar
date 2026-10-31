@@ -88,28 +88,61 @@ type Summary = {
   turn: number
   total: number
   maxCacheHit?: number
-  maxTps?: number
   minTtft?: number
+  turnTps?: number
+  turnStart?: number
+  turnEnd?: number
+  baseRuntime: number
 }
 
 function summarize(messages: Message[]): Summary {
   let total = 0
-  let lastUser = -1
+  const users: number[] = []
   for (let index = 0; index < messages.length; index++) {
-    if (messages[index].type === "user") lastUser = index
+    if (messages[index].type === "user") users.push(index)
     if (messages[index].type === "assistant") total += 1
   }
+  const lastUser = users.at(-1) ?? -1
   const turn = lastUser < 0 ? 0 : messages.slice(lastUser + 1).filter((message) => message.type === "assistant").length
   let maxCacheHit: number | undefined
-  let maxTps: number | undefined
   let minTtft: number | undefined
   for (const message of messages) {
     if (message.type !== "assistant") continue
     maxCacheHit = maxNumber(maxCacheHit, hitRate(message.tokens))
-    maxTps = maxNumber(maxTps, exactTps(message))
     minTtft = minNumber(minTtft, ttftFromMessage(message))
   }
-  return { turn, total, maxCacheHit, maxTps, minTtft }
+  let output = 0
+  let duration = 0
+  if (lastUser >= 0) {
+    for (let index = lastUser + 1; index < messages.length; index++) {
+      const message = messages[index]
+      if (message.type !== "assistant" || !message.tokens || message.time?.streamed === undefined) continue
+      output += message.tokens.output + message.tokens.reasoning
+      duration += Math.max(0, message.time.streamed - message.time.created)
+    }
+  }
+  const turnTps = output > 0 && duration > 0 ? output / (duration / 1000) : undefined
+  let baseRuntime = 0
+  let turnStart: number | undefined
+  let turnEnd: number | undefined
+  for (let index = 0; index < users.length; index++) {
+    const start = messages[users[index]].time?.created
+    if (start === undefined) continue
+    const next = index + 1 < users.length ? users[index + 1] : messages.length
+    let end: number | undefined
+    for (let inner = users[index] + 1; inner < next; inner++) {
+      const message = messages[inner]
+      if (message.type !== "assistant" || !message.time) continue
+      end = message.time.completed ?? message.time.streamed ?? message.time.created
+    }
+    if (index === users.length - 1) {
+      turnStart = start
+      turnEnd = end
+    } else if (end !== undefined) {
+      baseRuntime += Math.max(0, end - start)
+    }
+  }
+  return { turn, total, maxCacheHit, minTtft, turnTps, turnStart, turnEnd, baseRuntime }
 }
 
 function ttftValue(value?: number): string {
@@ -125,6 +158,16 @@ function pctValue(value?: number): string {
 function tpsValue(value?: number): string {
   if (value === undefined || !Number.isFinite(value)) return "—"
   return value.toFixed(1)
+}
+
+function durationValue(ms?: number): string {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return "—"
+  const seconds = ms / 1000
+  if (seconds < 60) return `${seconds.toFixed(1)}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m${Math.floor(seconds % 60)}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h${minutes % 60}m`
 }
 
 const VALUE_WIDTH = 7
@@ -196,6 +239,7 @@ function Panel(props: {
   metrics: Store<Record<string, Metrics>>
   summary: Store<Record<string, Summary>>
   ensureSummary: (sessionID: string, force?: boolean) => void
+  clock: Store<{ now: number }>
   view: Store<ViewState>
   setView: (mutation: (draft: ViewState) => void) => Promise<void>
   ui: Store<{ width: number }>
@@ -227,8 +271,36 @@ function Panel(props: {
   const ttft = () => current()?.ttft ?? ttftFromMessage(last())
   const tps = () => current()?.tps ?? exactTps(last())
   const maxCacheHit = () => summary()?.maxCacheHit ?? cacheHit()
-  const maxTps = () => summary()?.maxTps ?? tps()
+  const turnTps = () => summary()?.turnTps ?? tps()
   const sessionMinTtft = () => summary()?.minTtft ?? ttft()
+  const running = () => props.ctx.data.session.status(props.sessionID) === "running"
+  const turnStart = () => {
+    const list = messages()
+    for (let index = list.length - 1; index >= 0; index--) {
+      const message = list[index]
+      if (message.type === "user" && message.time?.created) return message.time.created
+    }
+    return summary()?.turnStart
+  }
+  const turnMs = () => {
+    const start = turnStart()
+    if (!start) return 0
+    const data = summary()
+    const end = running()
+      ? Math.max(props.clock.now, start)
+      : data?.turnEnd !== undefined && data.turnEnd > start
+        ? data.turnEnd
+        : start
+    return Math.max(0, end - start)
+  }
+  const totals = new Map<string, number>()
+  const sessionMs = () => {
+    const value = (summary()?.baseRuntime ?? 0) + turnMs()
+    const previous = totals.get(props.sessionID) ?? 0
+    const next = Math.max(previous, value)
+    totals.set(props.sessionID, next)
+    return next
+  }
 
   const toggle = () => {
     void props.setView((draft) => {
@@ -262,10 +334,11 @@ function Panel(props: {
 
       {!open() ? null : (
         <>
+          <MetricRow theme={theme} width={props.ui.width} label="Time" value={durationValue(turnMs())} max={durationValue(sessionMs())} level="good" />
           <MetricRow theme={theme} width={props.ui.width} label="Requests" value={String(requestsThisMessage())} max={String(requestsSession())} level="good" />
           <MetricRow theme={theme} width={props.ui.width} label="Cache hit" unit="%" value={pctValue(cacheHit())} max={pctValue(maxCacheHit())} level={cacheLevel(cacheHit())} />
           <MetricRow theme={theme} width={props.ui.width} label="TTFT" unit="s" value={ttftValue(ttft())} max={ttftValue(sessionMinTtft())} level={ttftLevel(ttft())} />
-          <MetricRow theme={theme} width={props.ui.width} label="TPS" unit="tok/s" value={tpsValue(tps())} max={tpsValue(maxTps())} level={tpsLevel(tps())} />
+          <MetricRow theme={theme} width={props.ui.width} label="TPS" unit="tok/s" value={tpsValue(tps())} max={tpsValue(turnTps())} level={tpsLevel(tps())} />
         </>
       )}
     </box>
@@ -296,7 +369,13 @@ export default Plugin.define({
     }
     const [view, setView] = ctx.storage.store<ViewState>("view", { initial: { open: true } })
     const [ui, setUI] = ctx.storage.memory<{ width: number }>("ui", { initial: { width: 34 } })
+    const [clock, setClock] = ctx.storage.memory<{ now: number }>("clock", { initial: { now: Date.now() } })
     const live = new Map<string, Live>()
+    const clockTimer = setInterval(() => {
+      setClock((draft) => {
+        draft.now = Date.now()
+      })
+    }, 100)
 
     const set = (sessionID: string, patch: Partial<Metrics>) => {
       setMetrics((draft) => {
@@ -409,6 +488,7 @@ export default Plugin.define({
           metrics={metrics}
           summary={summary}
           ensureSummary={ensureSummary}
+          clock={clock}
           view={view}
           setView={setView}
           ui={ui}
@@ -419,6 +499,7 @@ export default Plugin.define({
 
     return () => {
       clearInterval(timer)
+      clearInterval(clockTimer)
       stop()
       dispose()
     }
