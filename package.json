@@ -1,0 +1,66 @@
+{
+  "name": "opencode-live-metrics-sidebar",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Live cache hit, TTFT, TPS and request count in the OpenCode sidebar",
+  "exports": {
+    "./tui": "./dist/tui.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.2.0",
+    "@opentui/core": ">=0.8.0",
+    "@opentui/solid": ">=0.8.0",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@babel/core": "^7.28.0",
+    "@babel/preset-typescript": "^7.27.1",
+    "@opencode/plugin": "2.2.5",
+    "@opentui/core": "0.8.0",
+    "@opentui/solid": "0.8.0",
+    "@types/node": "^26.6.6",
+    "babel-preset-solid": "^1.9.16",
+    "solid-js": "1.9.16",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/silvaire-qwq/opencode-live-metrics-sidebar.git"
+  },
+  "homepage": "https://github.com/silvaire-qwq/opencode-live-metrics-sidebar#readme",
+  "bugs": {
+    "url": "https://github.com/silvaire-qwq/opencode-live-metrics-sidebar/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tui",
+    "sidebar",
+    "metrics",
+    "ttft",
+    "tps"
+  ]
+}
